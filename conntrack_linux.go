@@ -28,6 +28,11 @@ const (
 	seekCurrent = 1
 )
 
+type ConntrackFlowUpdate struct {
+	Type uint16
+	ConntrackFlow
+}
+
 // InetFamily Family type
 type InetFamily uint8
 
@@ -63,7 +68,22 @@ func ConntrackDeleteFilter(table ConntrackTableType, family InetFamily, filter C
 // ConntrackTableList returns the flow list of a table of a specific family using the netlink handle passed
 // conntrack -L [table] [options]          List conntrack or expectation table
 func (h *Handle) ConntrackTableList(table ConntrackTableType, family InetFamily) ([]*ConntrackFlow, error) {
-	res, err := h.dumpConntrackTable(table, family)
+	res, err := h.dumpConntrackTable(table, family, nl.IPCTNL_MSG_CT_GET)
+	if err != nil {
+		return nil, err
+	}
+
+	// Deserialize all the flows
+	var result []*ConntrackFlow
+	for _, dataRaw := range res {
+		result = append(result, parseRawData(dataRaw))
+	}
+
+	return result, nil
+}
+
+func (h *Handle) ConntrackTableListZero(table ConntrackTableType, family InetFamily) ([]*ConntrackFlow, error) {
+	res, err := h.dumpConntrackTable(table, family, nl.IPCTNL_MSG_CT_GET_CTRZERO)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +109,7 @@ func (h *Handle) ConntrackTableFlush(table ConntrackTableType) error {
 // ConntrackDeleteFilter deletes entries on the specified table on the base of the filter using the netlink handle passed
 // conntrack -D [table] parameters         Delete conntrack or expectation
 func (h *Handle) ConntrackDeleteFilter(table ConntrackTableType, family InetFamily, filter CustomConntrackFilter) (uint, error) {
-	res, err := h.dumpConntrackTable(table, family)
+	res, err := h.dumpConntrackTable(table, family, nl.IPCTNL_MSG_CT_GET)
 	if err != nil {
 		return 0, err
 	}
@@ -122,9 +142,52 @@ func (h *Handle) newConntrackRequest(table ConntrackTableType, family InetFamily
 	return req
 }
 
-func (h *Handle) dumpConntrackTable(table ConntrackTableType, family InetFamily) ([][]byte, error) {
-	req := h.newConntrackRequest(table, family, nl.IPCTNL_MSG_CT_GET, unix.NLM_F_DUMP)
+func (h *Handle) dumpConntrackTable(table ConntrackTableType, family InetFamily, operation int) ([][]byte, error) {
+	req := h.newConntrackRequest(table, family, operation, unix.NLM_F_DUMP)
 	return req.Execute(unix.NETLINK_NETFILTER, 0)
+}
+
+func SubscribeEvent(ch chan<- ConntrackFlowUpdate, done <-chan struct{}, cberr func(error), events ...uint) error {
+	s, err := nl.Subscribe(unix.NETLINK_NETFILTER, events...)
+	if err != nil {
+		return err
+	}
+	if done != nil {
+		go func() {
+			<-done
+			s.Close()
+		}()
+	}
+	go func() {
+		defer close(ch)
+		for {
+			msgs, from, err := s.Receive()
+			if err != nil {
+				if cberr != nil {
+					cberr(err)
+				}
+				return
+			}
+			if from.Pid != nl.PidKernel {
+				if cberr != nil {
+					cberr(fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
+				}
+				continue
+			}
+			for _, m := range msgs {
+				flow := parseRawData(m.Data)
+				if err != nil {
+					if cberr != nil {
+						cberr(err)
+					}
+					return
+				}
+				ch <- ConntrackFlowUpdate{Type: m.Header.Type & 0x00ff, ConntrackFlow: *flow}
+			}
+		}
+	}()
+
+	return nil
 }
 
 // The full conntrack flow structure is very complicated and can be found in the file:
